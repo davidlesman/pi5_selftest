@@ -12,9 +12,12 @@ from .config import (
     USB_REMOVE_TIMEOUT,
     USB_MOUNT_TIMEOUT,
     USB_FS_TIMEOUT,
-    USB_SETTLE_TIMEOUT,
 )
 
+# How long to let a freshly-detected device settle (SuperSpeed trains slower
+# than the block node appears). Local so config.py needn't change; move it there
+# if you prefer to keep all timeouts together.
+USB_SETTLE_TIMEOUT = 5.0
 
 # Optional sanity check that the operator used the right physical port. BOARD-
 # SPECIFIC (these are the sysfs port ids seen on one Pi 5 -- a blue port's USB2
@@ -162,15 +165,7 @@ def _usb_enum_diag(mark: int) -> str:
     """Describe why a USB port produced no usable drive."""
     stuck = _usb_scsi_stuck()
     if stuck:
-        port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
-        ids = _usb_ids_from(stuck) or "VID:PID"
-        return (
-            f" -- USB port {port}: device {ids} enumerated but READ CAPACITY failed, "
-            "so no block device came online (buggy UAS at SuperSpeed). Fix on this Pi "
-            "via /boot/firmware/cmdline.txt + reboot: 'modprobe.blacklist=uas' (all "
-            f"drives, recommended for a test rig) or 'usb-storage.quirks={ids}:u' "
-            "(just this drive)"
-        )
+        return " -- " + _ss_fail_msg(stuck)
     new = _dmesg_lines()[mark:]
     kw = ("usb", "xhci", "over-current", "overcurrent")
     hits = [ln for ln in new if any(k in ln.lower() for k in kw)]
@@ -235,16 +230,39 @@ def _usb_raw_read_test(rep: Report, label: str, name: str, size_mb: int = 64) ->
 USB_STORAGE_QUIRKS = "/sys/module/usb_storage/parameters/quirks"
 
 
-def _usb_transport(name: str) -> str:
-    """Which transport the block device is using: 'uas', 'usb-storage', or '?'.
-    Read from the bound driver of the device's USB interface (…:1.0)."""
-    real = os.path.realpath(f"/sys/block/{name}")
-    parts = real.split("/")
+def _driver_at(syspath: str) -> str:
+    """Driver bound to the USB interface (…:1.0) within a sysfs path:
+    'uas', 'usb-storage', or '?'. Works for a stuck device with no block node."""
+    parts = syspath.split("/")
     for i in range(len(parts), 0, -1):
         if re.match(r"^\d+-[\d.]+:\d+\.\d+$", parts[i - 1]):
-            drv = os.path.realpath("/".join(parts[:i]) + "/driver")
-            return os.path.basename(drv)
+            return os.path.basename(os.path.realpath("/".join(parts[:i]) + "/driver"))
     return "?"
+
+
+def _usb_transport(name: str) -> str:
+    """Which transport a live block device is using."""
+    return _driver_at(os.path.realpath(f"/sys/block/{name}"))
+
+
+def _ss_fail_msg(stuck: str) -> str:
+    """Honest description of an enumerated-but-no-block-device failure, naming
+    the actual transport and link speed so UAS isn't blamed when it's not the
+    cause (e.g. after blacklisting uas)."""
+    port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
+    ids = _usb_ids_from(stuck) or "VID:PID"
+    tr = _driver_at(stuck)
+    dev = _usb_devnode_from(stuck)
+    spd = (read(os.path.join(dev, "speed")) if dev else None) or "?"
+    return (
+        f"device {ids} trained to {spd} Mbps on port {port} but READ CAPACITY failed "
+        f"under {tr} -- a SuperSpeed/drive incompatibility, not a transport bug "
+        f"({'BOT' if tr != 'uas' else 'UAS'} is in use and still fails). The port is "
+        "likely fine: test it with a known-good USB3 drive. This drive works at USB2. "
+        f"To try to rescue it at SuperSpeed: 'usbcore.quirks={ids}:k' (disable link "
+        "power management) in /boot/firmware/cmdline.txt + reboot, then power-cycle the "
+        "drive"
+    )
 
 
 def _usb_devnode_from(syspath: str) -> Optional[str]:
@@ -385,28 +403,36 @@ def phase_usb(rep: Report) -> None:
         # instead of latching onto a half-enumerated node.
         found = _poll(lambda: _usb_new_port(before), USB_DETECT_TIMEOUT)
         bot_note = ""
-        if not found:
-            # No usable block device. If a USB SCSI disk enumerated but produced
-            # none, that's a UAS failure -- record it, then try BOT for the same
-            # drive so we can tell "drive's UAS is bad, port is fine" apart from
-            # "port/drive is dead".
+        if not found and is_root():
+            # A USB SCSI disk that enumerated but produced no block device. Only
+            # blame UAS (and try the BOT fallback) if it's actually on UAS. If it
+            # already failed under BOT, that's a SuperSpeed-level problem and the
+            # fallback is pointless -- report it honestly instead.
             stuck = _usb_scsi_stuck()
-            if stuck and is_root():
-                rep.add(
-                    f"USB {label} UAS",
-                    FAIL,
-                    "enumerated but no block device under UAS (READ CAPACITY failed)",
-                )
-                found = _force_bot_and_retry(rep, label, stuck)
-                bot_note = " via BOT fallback"
-            if not found:
-                rep.add(
-                    f"USB {label}",
-                    FAIL,
-                    f"no new ready storage device within {USB_DETECT_TIMEOUT:.0f}s"
-                    + _usb_enum_diag(dmesg_mark),
-                )
-                continue
+            if stuck:
+                if _driver_at(stuck) == "uas":
+                    rep.add(
+                        f"USB {label} UAS",
+                        FAIL,
+                        "enumerated but no block device under UAS (READ CAPACITY failed)",
+                    )
+                    found = _force_bot_and_retry(rep, label, stuck)
+                    if found:
+                        bot_note = " via BOT fallback"
+                    else:
+                        rep.add(f"USB {label}", FAIL, _ss_fail_msg(stuck))
+                        continue
+                else:
+                    rep.add(f"USB {label}", FAIL, _ss_fail_msg(stuck))
+                    continue
+        if not found:
+            rep.add(
+                f"USB {label}",
+                FAIL,
+                f"no new ready storage device within {USB_DETECT_TIMEOUT:.0f}s"
+                + _usb_enum_diag(dmesg_mark),
+            )
+            continue
         port, name = found
         transport = _usb_transport(name)
         if transport == "uas":
