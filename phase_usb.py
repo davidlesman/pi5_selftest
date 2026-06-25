@@ -143,6 +143,32 @@ def _usb_ids_from(devpath: str) -> Optional[str]:
     return None
 
 
+def _usb_fail_detail(stuck: str, mark: int = 0) -> str:
+    """Honest failure detail for an enumerated-but-no-block-device drive. If the
+    kernel logged an over-current trip, it's the Pi 5's 600mA USB cap (needs a
+    5A PD supply); otherwise it's a SuperSpeed/drive-level problem."""
+    oc = any(
+        "over-current" in ln.lower() or "overcurrent" in ln.lower()
+        for ln in _dmesg_lines()[mark:]
+    )
+    if oc:
+        port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
+        ids = _usb_ids_from(stuck) or "VID:PID"
+        dev = _usb_devnode_from(stuck)
+        spd = (read(os.path.join(dev, "speed")) if dev else None) or "?"
+        maxp = read(os.path.join(dev, "bMaxPower")) if dev else None
+        req = f", which requests {maxp}" if maxp else ""
+        return (
+            f"port {port} tripped USB OVER-CURRENT with {ids} at {spd} Mbps{req}. The "
+            "Pi 5 caps total USB current at 600mA unless powered by a 5V/5A PD supply, "
+            "and a SuperSpeed drive draws more than at USB2 -- so it browns out and "
+            "disconnects mid-spin-up. Fix the power, not the port: use the official 27W "
+            "supply, set usb_max_current_enable=1 in /boot/firmware/config.txt, or run "
+            "the drive through a powered USB hub. (Not a transport or port fault.)"
+        )
+    return _ss_fail_msg(stuck)
+
+
 def _usb_scsi_stuck() -> Optional[str]:
     """Find a USB-attached SCSI disk that enumerated but never produced a block
     device (READ CAPACITY failed/hung). Returns its sysfs path if found. This is
@@ -165,7 +191,7 @@ def _usb_enum_diag(mark: int) -> str:
     """Describe why a USB port produced no usable drive."""
     stuck = _usb_scsi_stuck()
     if stuck:
-        return " -- " + _ss_fail_msg(stuck)
+        return " -- " + _usb_fail_detail(stuck, mark)
     new = _dmesg_lines()[mark:]
     kw = ("usb", "xhci", "over-current", "overcurrent")
     hits = [ln for ln in new if any(k in ln.lower() for k in kw)]
@@ -420,10 +446,12 @@ def phase_usb(rep: Report) -> None:
                     if found:
                         bot_note = " via BOT fallback"
                     else:
-                        rep.add(f"USB {label}", FAIL, _ss_fail_msg(stuck))
+                        rep.add(
+                            f"USB {label}", FAIL, _usb_fail_detail(stuck, dmesg_mark)
+                        )
                         continue
                 else:
-                    rep.add(f"USB {label}", FAIL, _ss_fail_msg(stuck))
+                    rep.add(f"USB {label}", FAIL, _usb_fail_detail(stuck, dmesg_mark))
                     continue
         if not found:
             rep.add(
