@@ -16,6 +16,20 @@ from .config import (
 )
 
 
+# Optional sanity check that the operator used the right physical port. BOARD-
+# SPECIFIC (these are the sysfs port ids seen on one Pi 5 -- a blue port's USB2
+# fallback and other board revisions can differ). Empty = check disabled. Fill
+# in from one careful labeled pass; mismatches are reported as INFO, never FAIL.
+# Known from logs (Pi 5): bottom-left=2-1, top-left=4-1, bottom-right=3-2,
+# top-right=1-2 (SuperSpeed view for the blue ports).
+EXPECTED_PORTS: Dict[str, set] = {
+    # "bottom-left": {"2-1", "1-1"},
+    # "top-left": {"4-1", "3-1"},
+    # "bottom-right": {"3-2"},
+    # "top-right": {"1-2"},
+}
+
+
 def _usb_speed_for(block: str) -> Optional[str]:
     try:
         d = os.path.realpath(f"/sys/block/{block}")
@@ -111,8 +125,52 @@ def _dmesg_lines() -> List[str]:
     return out.splitlines() if rc == 0 else []
 
 
+def _usb_ids_from(devpath: str) -> Optional[str]:
+    """Walk up a sysfs device path to the USB device node and read VID:PID."""
+    d = devpath
+    for _ in range(12):
+        vid = read(os.path.join(d, "idVendor"))
+        pid = read(os.path.join(d, "idProduct"))
+        if vid and pid:
+            return f"{vid}:{pid}"
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _usb_scsi_stuck() -> Optional[str]:
+    """Find a USB-attached SCSI disk that enumerated but never produced a block
+    device (READ CAPACITY failed/hung). Returns its sysfs path if found. This is
+    the UAS-at-SuperSpeed failure: sg0 appears, sda never does."""
+    base = "/sys/class/scsi_device"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return None
+    for entry in entries:
+        real = os.path.realpath(os.path.join(base, entry, "device"))
+        if "/usb" not in real:
+            continue
+        if not os.path.isdir(os.path.join(real, "block")):
+            return real  # SCSI disk with no block child = stuck
+    return None
+
+
 def _usb_enum_diag(mark: int) -> str:
-    """Describe what the kernel logged for a USB port since line <mark>."""
+    """Describe why a USB port produced no usable drive."""
+    stuck = _usb_scsi_stuck()
+    if stuck:
+        port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
+        ids = _usb_ids_from(stuck) or "VID:PID"
+        return (
+            f" -- USB port {port}: device {ids} enumerated but READ CAPACITY failed, "
+            "so no block device came online (buggy UAS at SuperSpeed). Fix on this Pi "
+            "via /boot/firmware/cmdline.txt + reboot: 'modprobe.blacklist=uas' (all "
+            f"drives, recommended for a test rig) or 'usb-storage.quirks={ids}:u' "
+            "(just this drive)"
+        )
     new = _dmesg_lines()[mark:]
     kw = ("usb", "xhci", "over-current", "overcurrent")
     hits = [ln for ln in new if any(k in ln.lower() for k in kw)]
@@ -174,6 +232,105 @@ def _usb_raw_read_test(rep: Report, label: str, name: str, size_mb: int = 64) ->
     )
 
 
+USB_STORAGE_QUIRKS = "/sys/module/usb_storage/parameters/quirks"
+
+
+def _usb_transport(name: str) -> str:
+    """Which transport the block device is using: 'uas', 'usb-storage', or '?'.
+    Read from the bound driver of the device's USB interface (…:1.0)."""
+    real = os.path.realpath(f"/sys/block/{name}")
+    parts = real.split("/")
+    for i in range(len(parts), 0, -1):
+        if re.match(r"^\d+-[\d.]+:\d+\.\d+$", parts[i - 1]):
+            drv = os.path.realpath("/".join(parts[:i]) + "/driver")
+            return os.path.basename(drv)
+    return "?"
+
+
+def _usb_devnode_from(syspath: str) -> Optional[str]:
+    """The /sys/bus/usb/devices/<portid> node for a device's sysfs path."""
+    port = next((p for p in syspath.split("/") if re.match(r"^\d+-[\d.]+$", p)), None)
+    if not port:
+        return None
+    node = f"/sys/bus/usb/devices/{port}"
+    return node if os.path.exists(node) else None
+
+
+def _set_ignore_uas_quirk(ids: str) -> bool:
+    """Add VID:PID:u to usb-storage's runtime quirks so this device uses Bulk-
+    Only Transport on its next connect. Session-only (resets on reboot); leaves
+    UAS active for every other device."""
+    if not os.path.exists(USB_STORAGE_QUIRKS):
+        sh(["modprobe", "usb_storage"])
+    if not os.path.exists(USB_STORAGE_QUIRKS):
+        return False
+    cur = read(USB_STORAGE_QUIRKS) or ""
+    entries = [e for e in cur.split(",") if e]
+    want = f"{ids}:u"
+    if want not in entries:
+        entries.append(want)
+    try:
+        with open(USB_STORAGE_QUIRKS, "w") as f:
+            f.write(",".join(entries))
+        return True
+    except OSError:
+        return False
+
+
+def _reenumerate(devnode: str) -> bool:
+    """Force a device to disconnect+reconnect (so a new quirk takes effect)
+    without a physical replug, by toggling its 'authorized' attribute."""
+    auth = os.path.join(devnode, "authorized")
+    if not os.path.exists(auth):
+        return False
+    try:
+        with open(auth, "w") as f:
+            f.write("0")
+        time.sleep(0.6)
+        with open(auth, "w") as f:
+            f.write("1")
+        time.sleep(0.6)
+        return True
+    except OSError:
+        return False
+
+
+def _force_bot_and_retry(
+    rep: Report, label: str, stuck_path: str
+) -> Optional[Tuple[str, str]]:
+    """UAS failed for this device. Set the ignore-UAS quirk, re-enumerate, and
+    see if it now comes up under Bulk-Only Transport. Returns (port, name) on
+    success. Runtime only -- no reboot, no cmdline change, UAS stays default."""
+    if not is_root():
+        return None
+    ids = _usb_ids_from(stuck_path)
+    if not ids:
+        return None
+    if not _set_ignore_uas_quirk(ids):
+        rep.add(
+            f"USB {label} BOT fallback",
+            SKIP,
+            f"could not set usb-storage quirk for {ids} (module not loaded?)",
+        )
+        return None
+    devnode = _usb_devnode_from(stuck_path)
+    baseline = _usb_occupied_ports(ready_only=True)
+    if not (devnode and _reenumerate(devnode)):
+        rep.add(
+            f"USB {label} BOT fallback",
+            SKIP,
+            f"quirk {ids}:u set but couldn't auto re-enumerate; replug the drive, "
+            "or bake usb-storage.quirks into cmdline.txt",
+        )
+        return None
+    rep.add(
+        f"USB {label} BOT fallback",
+        INFO,
+        f"UAS failed; forced {ids} onto Bulk-Only Transport and re-enumerated",
+    )
+    return _poll(lambda: _usb_new_port(baseline), USB_DETECT_TIMEOUT)
+
+
 def _usb_rw(rep: Report, label: str, name: str) -> None:
     """Run the r/w test on a USB disk, mounting it ourselves if needed."""
     mp = _poll(lambda: _mountpoint_for([name]), USB_MOUNT_TIMEOUT)
@@ -227,20 +384,47 @@ def phase_usb(rep: Report) -> None:
         # is what makes USB3 reliable: we wait out the SuperSpeed-training gap
         # instead of latching onto a half-enumerated node.
         found = _poll(lambda: _usb_new_port(before), USB_DETECT_TIMEOUT)
+        bot_note = ""
         if not found:
-            rep.add(
-                f"USB {label}",
-                FAIL,
-                f"no new ready storage device within {USB_DETECT_TIMEOUT:.0f}s"
-                + _usb_enum_diag(dmesg_mark),
-            )
-            continue
+            # No usable block device. If a USB SCSI disk enumerated but produced
+            # none, that's a UAS failure -- record it, then try BOT for the same
+            # drive so we can tell "drive's UAS is bad, port is fine" apart from
+            # "port/drive is dead".
+            stuck = _usb_scsi_stuck()
+            if stuck and is_root():
+                rep.add(
+                    f"USB {label} UAS",
+                    FAIL,
+                    "enumerated but no block device under UAS (READ CAPACITY failed)",
+                )
+                found = _force_bot_and_retry(rep, label, stuck)
+                bot_note = " via BOT fallback"
+            if not found:
+                rep.add(
+                    f"USB {label}",
+                    FAIL,
+                    f"no new ready storage device within {USB_DETECT_TIMEOUT:.0f}s"
+                    + _usb_enum_diag(dmesg_mark),
+                )
+                continue
         port, name = found
+        transport = _usb_transport(name)
+        if transport == "uas":
+            rep.add(f"USB {label} UAS", PASS, "block device came up under UAS")
+        exp = EXPECTED_PORTS.get(label.split()[0])
+        if exp and port not in exp:
+            rep.add(
+                f"USB {label} port check",
+                INFO,
+                f"drive enumerated on USB port {port}, expected {sorted(exp)} "
+                "-- wrong physical port, a USB2 fallback on a blue port, or a "
+                "board that differs from EXPECTED_PORTS",
+            )
         spd_raw = _settled_speed(name)
         rep.add(
             f"USB {label} enumerate",
             PASS,
-            f"/dev/{name} @ {spd_raw} Mbps (USB port {port})",
+            f"/dev/{name} @ {spd_raw} Mbps (USB port {port}, {transport}){bot_note}",
         )
         try:
             spd = int(spd_raw)
