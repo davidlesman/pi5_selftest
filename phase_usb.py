@@ -12,12 +12,9 @@ from .config import (
     USB_REMOVE_TIMEOUT,
     USB_MOUNT_TIMEOUT,
     USB_FS_TIMEOUT,
+    USB_SETTLE_TIMEOUT,
 )
 
-# How long to let a freshly-detected device settle (SuperSpeed trains slower
-# than the block node appears). Local so config.py needn't change; move it there
-# if you prefer to keep all timeouts together.
-USB_SETTLE_TIMEOUT = 5.0
 
 # Optional sanity check that the operator used the right physical port. BOARD-
 # SPECIFIC (these are the sysfs port ids seen on one Pi 5 -- a blue port's USB2
@@ -143,36 +140,77 @@ def _usb_ids_from(devpath: str) -> Optional[str]:
     return None
 
 
+def _usb_devnode_from(syspath: str) -> Optional[str]:
+    """The /sys/bus/usb/devices/<portid> node for a device's sysfs path."""
+    port = next((p for p in syspath.split("/") if re.match(r"^\d+-[\d.]+$", p)), None)
+    if not port:
+        return None
+    node = f"/sys/bus/usb/devices/{port}"
+    return node if os.path.exists(node) else None
+
+
+def _get_usb_current_limit() -> int:
+    """Returns the current active USB power limit in mA (600mA or 1600mA)."""
+    if have("vcgencmd"):
+        rc, out = sh(["vcgencmd", "get_config", "usb_max_current_enable"])
+        if rc == 0 and "1" in out.split("=")[-1]:
+            return 1600
+    for config_path in ["/boot/firmware/config.txt", "/boot/config.txt"]:
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    for line in f:
+                        if re.match(r"^\s*usb_max_current_enable\s*=\s*1", line):
+                            return 1600
+            except OSError:
+                pass
+    return 600
+
+
+def _get_requested_current(syspath: str) -> Optional[int]:
+    """Extracts the requested current in mA from bMaxPower."""
+    dev = _usb_devnode_from(syspath)
+    if not dev:
+        return None
+    maxp = read(os.path.join(dev, "bMaxPower"))
+    if not maxp:
+        return None
+    m = re.search(r"(\d+)", maxp)
+    return int(m.group(1)) if m else None
+
+
 def _usb_fail_detail(stuck: str, mark: int = 0) -> str:
     """Honest failure detail for an enumerated-but-no-block-device drive. If the
-    kernel logged an over-current trip, it's the Pi 5's 600mA USB cap (needs a
-    5A PD supply); otherwise it's a SuperSpeed/drive-level problem."""
+    kernel logged an over-current trip or power budget is exceeded, explicit instructions
+    for Raspberry Pi 5 power management are provided."""
     oc = any(
         "over-current" in ln.lower() or "overcurrent" in ln.lower()
         for ln in _dmesg_lines()[mark:]
     )
-    if oc:
-        port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
-        ids = _usb_ids_from(stuck) or "VID:PID"
-        dev = _usb_devnode_from(stuck)
-        spd = (read(os.path.join(dev, "speed")) if dev else None) or "?"
-        maxp = read(os.path.join(dev, "bMaxPower")) if dev else None
-        req = f", which requests {maxp}" if maxp else ""
+    port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
+    ids = _usb_ids_from(stuck) or "VID:PID"
+    dev = _usb_devnode_from(stuck)
+    spd = (read(os.path.join(dev, "speed")) if dev else None) or "?"
+
+    req_ma = _get_requested_current(stuck)
+    limit_ma = _get_usb_current_limit()
+    req_str = f", which requests {req_ma}mA" if req_ma else ""
+
+    if oc or (req_ma and req_ma > limit_ma):
         return (
-            f"port {port} tripped USB OVER-CURRENT with {ids} at {spd} Mbps{req}. The "
-            "Pi 5 caps total USB current at 600mA unless powered by a 5V/5A PD supply, "
-            "and a SuperSpeed drive draws more than at USB2 -- so it browns out and "
-            "disconnects mid-spin-up. Fix the power, not the port: use the official 27W "
-            "supply, set usb_max_current_enable=1 in /boot/firmware/config.txt, or run "
-            "the drive through a powered USB hub. (Not a transport or port fault.)"
+            f"port {port} experienced a power issue with {ids} at {spd} Mbps{req_str}. "
+            f"The active system limit is {limit_ma}mA. The Pi 5 caps total USB current at 600mA "
+            "unless powered by a 5V/5A PD supply or usb_max_current_enable=1 is explicitly set. "
+            "A SuperSpeed drive draws more power than at USB2, causing it to brown out and "
+            "disconnect mid-spin-up. Fix the power: use the official 27W supply, set "
+            "usb_max_current_enable=1 in /boot/firmware/config.txt, or use a powered USB hub."
         )
     return _ss_fail_msg(stuck)
 
 
 def _usb_scsi_stuck() -> Optional[str]:
     """Find a USB-attached SCSI disk that enumerated but never produced a block
-    device (READ CAPACITY failed/hung). Returns its sysfs path if found. This is
-    the UAS-at-SuperSpeed failure: sg0 appears, sda never does."""
+    device (READ CAPACITY failed/hung). Returns its sysfs path if found."""
     base = "/sys/class/scsi_device"
     try:
         entries = os.listdir(base)
@@ -210,8 +248,7 @@ def _usb_enum_diag(mark: int) -> str:
 
 
 def _usb_raw_read_test(rep: Report, label: str, name: str, size_mb: int = 64) -> None:
-    """Read-only raw test for drives with no filesystem (blank/unformatted).
-    Never writes to an unknown raw disk."""
+    """Read-only raw test for drives with no filesystem (blank/unformatted)."""
     sectors = read(f"/sys/block/{name}/size") or "0"
     try:
         dev_mib = int(sectors) * 512 / (1 << 20)
@@ -230,7 +267,7 @@ def _usb_raw_read_test(rep: Report, label: str, name: str, size_mb: int = 64) ->
     t0 = time.monotonic()
     rc, out = sh(cmd + ["iflag=direct"], timeout=60)
     dt = time.monotonic() - t0
-    if rc != 0:  # some paths reject O_DIRECT; retry buffered
+    if rc != 0:
         t0 = time.monotonic()
         rc, out = sh(cmd, timeout=60)
         dt = time.monotonic() - t0
@@ -253,12 +290,8 @@ def _usb_raw_read_test(rep: Report, label: str, name: str, size_mb: int = 64) ->
     )
 
 
-USB_STORAGE_QUIRKS = "/sys/module/usb_storage/parameters/quirks"
-
-
 def _driver_at(syspath: str) -> str:
-    """Driver bound to the USB interface (…:1.0) within a sysfs path:
-    'uas', 'usb-storage', or '?'. Works for a stuck device with no block node."""
+    """Driver bound to the USB interface within a sysfs path."""
     parts = syspath.split("/")
     for i in range(len(parts), 0, -1):
         if re.match(r"^\d+-[\d.]+:\d+\.\d+$", parts[i - 1]):
@@ -272,9 +305,7 @@ def _usb_transport(name: str) -> str:
 
 
 def _ss_fail_msg(stuck: str) -> str:
-    """Honest description of an enumerated-but-no-block-device failure, naming
-    the actual transport and link speed so UAS isn't blamed when it's not the
-    cause (e.g. after blacklisting uas)."""
+    """Honest description of an enumerated-but-no-block-device failure."""
     port = next((p for p in stuck.split("/") if re.match(r"^\d+-[\d.]+$", p)), "?")
     ids = _usb_ids_from(stuck) or "VID:PID"
     tr = _driver_at(stuck)
@@ -282,97 +313,10 @@ def _ss_fail_msg(stuck: str) -> str:
     spd = (read(os.path.join(dev, "speed")) if dev else None) or "?"
     return (
         f"device {ids} trained to {spd} Mbps on port {port} but READ CAPACITY failed "
-        f"under {tr} -- a SuperSpeed/drive incompatibility, not a transport bug "
-        f"({'BOT' if tr != 'uas' else 'UAS'} is in use and still fails). The port is "
-        "likely fine: test it with a known-good USB3 drive. This drive works at USB2. "
-        f"To try to rescue it at SuperSpeed: 'usbcore.quirks={ids}:k' (disable link "
-        "power management) in /boot/firmware/cmdline.txt + reboot, then power-cycle the "
-        "drive"
+        f"under {tr}. The port is likely fine: test it with a known-good USB3 drive. "
+        f"To try to rescue this drive at SuperSpeed: add 'usbcore.quirks={ids}:k' "
+        f"to /boot/firmware/cmdline.txt + reboot."
     )
-
-
-def _usb_devnode_from(syspath: str) -> Optional[str]:
-    """The /sys/bus/usb/devices/<portid> node for a device's sysfs path."""
-    port = next((p for p in syspath.split("/") if re.match(r"^\d+-[\d.]+$", p)), None)
-    if not port:
-        return None
-    node = f"/sys/bus/usb/devices/{port}"
-    return node if os.path.exists(node) else None
-
-
-def _set_ignore_uas_quirk(ids: str) -> bool:
-    """Add VID:PID:u to usb-storage's runtime quirks so this device uses Bulk-
-    Only Transport on its next connect. Session-only (resets on reboot); leaves
-    UAS active for every other device."""
-    if not os.path.exists(USB_STORAGE_QUIRKS):
-        sh(["modprobe", "usb_storage"])
-    if not os.path.exists(USB_STORAGE_QUIRKS):
-        return False
-    cur = read(USB_STORAGE_QUIRKS) or ""
-    entries = [e for e in cur.split(",") if e]
-    want = f"{ids}:u"
-    if want not in entries:
-        entries.append(want)
-    try:
-        with open(USB_STORAGE_QUIRKS, "w") as f:
-            f.write(",".join(entries))
-        return True
-    except OSError:
-        return False
-
-
-def _reenumerate(devnode: str) -> bool:
-    """Force a device to disconnect+reconnect (so a new quirk takes effect)
-    without a physical replug, by toggling its 'authorized' attribute."""
-    auth = os.path.join(devnode, "authorized")
-    if not os.path.exists(auth):
-        return False
-    try:
-        with open(auth, "w") as f:
-            f.write("0")
-        time.sleep(0.6)
-        with open(auth, "w") as f:
-            f.write("1")
-        time.sleep(0.6)
-        return True
-    except OSError:
-        return False
-
-
-def _force_bot_and_retry(
-    rep: Report, label: str, stuck_path: str
-) -> Optional[Tuple[str, str]]:
-    """UAS failed for this device. Set the ignore-UAS quirk, re-enumerate, and
-    see if it now comes up under Bulk-Only Transport. Returns (port, name) on
-    success. Runtime only -- no reboot, no cmdline change, UAS stays default."""
-    if not is_root():
-        return None
-    ids = _usb_ids_from(stuck_path)
-    if not ids:
-        return None
-    if not _set_ignore_uas_quirk(ids):
-        rep.add(
-            f"USB {label} BOT fallback",
-            SKIP,
-            f"could not set usb-storage quirk for {ids} (module not loaded?)",
-        )
-        return None
-    devnode = _usb_devnode_from(stuck_path)
-    baseline = _usb_occupied_ports(ready_only=True)
-    if not (devnode and _reenumerate(devnode)):
-        rep.add(
-            f"USB {label} BOT fallback",
-            SKIP,
-            f"quirk {ids}:u set but couldn't auto re-enumerate; replug the drive, "
-            "or bake usb-storage.quirks into cmdline.txt",
-        )
-        return None
-    rep.add(
-        f"USB {label} BOT fallback",
-        INFO,
-        f"UAS failed; forced {ids} onto Bulk-Only Transport and re-enumerated",
-    )
-    return _poll(lambda: _usb_new_port(baseline), USB_DETECT_TIMEOUT)
 
 
 def _usb_rw(rep: Report, label: str, name: str) -> None:
@@ -384,8 +328,6 @@ def _usb_rw(rep: Report, label: str, name: str) -> None:
     if not is_root():
         rep.add(f"USB {label} read/write", SKIP, "not mounted (run with sudo to mount)")
         return
-    # Device is already confirmed ready before we get here, but the partition
-    # table read can still lag a touch -- poll briefly before calling it blank.
     part = _poll(lambda: _block_fs_partition(name), USB_FS_TIMEOUT)
     if not part:
         _usb_raw_read_test(rep, label, name)
@@ -420,39 +362,16 @@ def phase_usb(rep: Report) -> None:
         ("top-right (USB 2.0, black)", 480),
     ]
     for label, want_speed in ports:
-        before = _usb_occupied_ports()  # everything present, ready or not
+        before = _usb_occupied_ports()
         dmesg_mark = len(_dmesg_lines())
         prompt(rep, f"Plug a USB flash drive into the {label} port.")
 
-        # Only accept a NEW port whose device is actually ready (size > 0). This
-        # is what makes USB3 reliable: we wait out the SuperSpeed-training gap
-        # instead of latching onto a half-enumerated node.
         found = _poll(lambda: _usb_new_port(before), USB_DETECT_TIMEOUT)
-        bot_note = ""
         if not found and is_root():
-            # A USB SCSI disk that enumerated but produced no block device. Only
-            # blame UAS (and try the BOT fallback) if it's actually on UAS. If it
-            # already failed under BOT, that's a SuperSpeed-level problem and the
-            # fallback is pointless -- report it honestly instead.
             stuck = _usb_scsi_stuck()
             if stuck:
-                if _driver_at(stuck) == "uas":
-                    rep.add(
-                        f"USB {label} UAS",
-                        FAIL,
-                        "enumerated but no block device under UAS (READ CAPACITY failed)",
-                    )
-                    found = _force_bot_and_retry(rep, label, stuck)
-                    if found:
-                        bot_note = " via BOT fallback"
-                    else:
-                        rep.add(
-                            f"USB {label}", FAIL, _usb_fail_detail(stuck, dmesg_mark)
-                        )
-                        continue
-                else:
-                    rep.add(f"USB {label}", FAIL, _usb_fail_detail(stuck, dmesg_mark))
-                    continue
+                rep.add(f"USB {label}", FAIL, _usb_fail_detail(stuck, dmesg_mark))
+                continue
         if not found:
             rep.add(
                 f"USB {label}",
@@ -461,6 +380,7 @@ def phase_usb(rep: Report) -> None:
                 + _usb_enum_diag(dmesg_mark),
             )
             continue
+
         port, name = found
         transport = _usb_transport(name)
         if transport == "uas":
@@ -478,7 +398,7 @@ def phase_usb(rep: Report) -> None:
         rep.add(
             f"USB {label} enumerate",
             PASS,
-            f"/dev/{name} @ {spd_raw} Mbps (USB port {port}, {transport}){bot_note}",
+            f"/dev/{name} @ {spd_raw} Mbps (USB port {port}, {transport})",
         )
         try:
             spd = int(spd_raw)
@@ -489,6 +409,28 @@ def phase_usb(rep: Report) -> None:
             rep.add(f"USB {label} negotiated speed", PASS if ok else FAIL, detail)
         except ValueError:
             rep.add(f"USB {label} negotiated speed", SKIP, "speed unknown")
+
+        # --- Active Current Allocation & Power Budget Verification ---
+        limit_ma = _get_usb_current_limit()
+        req_ma = _get_requested_current(os.path.realpath(f"/sys/block/{name}"))
+        if req_ma:
+            budget_ok = req_ma <= limit_ma
+            rep.add(
+                f"USB {label} power budget",
+                PASS if budget_ok else FAIL,
+                f"Drive requested {req_ma}mA, system limit is {limit_ma}mA"
+                + (
+                    ""
+                    if budget_ok
+                    else " -- Exceeds budget! Uncap via usb_max_current_enable=1 or use a 5A supply."
+                ),
+            )
+        else:
+            rep.add(
+                f"USB {label} power budget",
+                INFO,
+                f"Could not read bMaxPower; system current limit is {limit_ma}mA",
+            )
 
         _usb_rw(rep, label, name)
 
