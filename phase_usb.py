@@ -12,6 +12,7 @@ from .config import (
     USB_REMOVE_TIMEOUT,
     USB_MOUNT_TIMEOUT,
     USB_FS_TIMEOUT,
+    USB_SETTLE_TIMEOUT,
 )
 
 
@@ -29,6 +30,17 @@ def _usb_speed_for(block: str) -> Optional[str]:
             break
         d = parent
     return None
+
+
+def _block_ready(name: str) -> bool:
+    """True once the kernel has read the device capacity (size > 0). Right after
+    a USB3 stick is plugged, /dev/sdX exists but size is briefly 0 while the
+    SuperSpeed link trains and READ CAPACITY completes -- that gap is the source
+    of the flaky USB3 detections."""
+    try:
+        return int(read(f"/sys/block/{name}/size") or "0") > 0
+    except (ValueError, TypeError):
+        return False
 
 
 def _usb_disks() -> Dict[str, str]:
@@ -51,21 +63,44 @@ def _usb_port_path(name: str) -> Optional[str]:
     return toks[-1] if toks else None
 
 
-def _usb_occupied_ports() -> Dict[str, str]:
-    """Map physical-USB-port -> block name for every USB storage device present."""
+def _usb_occupied_ports(ready_only: bool = False) -> Dict[str, str]:
+    """Map physical-USB-port -> block name for USB storage devices present.
+    With ready_only, only count devices the kernel has finished enumerating."""
     occ: Dict[str, str] = {}
     for name in _usb_disks():
         p = _usb_port_path(name)
-        if p:
-            occ[p] = name
+        if not p:
+            continue
+        if ready_only and not _block_ready(name):
+            continue
+        occ[p] = name
     return occ
 
 
-def _usb_new_port(before: Dict[str, str]) -> Optional[Tuple[str, str]]:
-    """Return (port, block_name) for the first USB port that appeared since `before`."""
-    now = _usb_occupied_ports()
+def _usb_new_port(
+    before: Dict[str, str], ready_only: bool = True
+) -> Optional[Tuple[str, str]]:
+    """First USB port that appeared since `before`. Defaults to ready_only so a
+    half-enumerated device isn't accepted until its capacity is readable."""
+    now = _usb_occupied_ports(ready_only=ready_only)
     fresh = [p for p in now if p not in before]
     return (fresh[0], now[fresh[0]]) if fresh else None
+
+
+def _settled_speed(name: str) -> str:
+    """Read the negotiated speed, giving it a moment to populate (the speed
+    attribute can lag the block node by a fraction of a second on USB3)."""
+    spd = _usb_speed_for(name)
+    if spd and spd.isdigit():
+        return spd
+    spd = _poll(
+        lambda: (
+            _usb_speed_for(name) if (_usb_speed_for(name) or "").isdigit() else None
+        ),
+        USB_SETTLE_TIMEOUT,
+        interval=0.25,
+    )
+    return spd or _usb_speed_for(name) or "?"
 
 
 def _dmesg_lines() -> List[str]:
@@ -148,9 +183,8 @@ def _usb_rw(rep: Report, label: str, name: str) -> None:
     if not is_root():
         rep.add(f"USB {label} read/write", SKIP, "not mounted (run with sudo to mount)")
         return
-    # Poll for the partition table: right after enumeration the kernel may not
-    # have read it yet, so a single check can spuriously report "no filesystem"
-    # for a drive that actually has one (the intermittent SKIP you saw).
+    # Device is already confirmed ready before we get here, but the partition
+    # table read can still lag a touch -- poll briefly before calling it blank.
     part = _poll(lambda: _block_fs_partition(name), USB_FS_TIMEOUT)
     if not part:
         _usb_raw_read_test(rep, label, name)
@@ -185,21 +219,24 @@ def phase_usb(rep: Report) -> None:
         ("top-right (USB 2.0, black)", 480),
     ]
     for label, want_speed in ports:
-        before = _usb_occupied_ports()
+        before = _usb_occupied_ports()  # everything present, ready or not
         dmesg_mark = len(_dmesg_lines())
         prompt(rep, f"Plug a USB flash drive into the {label} port.")
 
+        # Only accept a NEW port whose device is actually ready (size > 0). This
+        # is what makes USB3 reliable: we wait out the SuperSpeed-training gap
+        # instead of latching onto a half-enumerated node.
         found = _poll(lambda: _usb_new_port(before), USB_DETECT_TIMEOUT)
         if not found:
             rep.add(
                 f"USB {label}",
                 FAIL,
-                f"no new storage device within {USB_DETECT_TIMEOUT:.0f}s"
+                f"no new ready storage device within {USB_DETECT_TIMEOUT:.0f}s"
                 + _usb_enum_diag(dmesg_mark),
             )
             continue
         port, name = found
-        spd_raw = _usb_speed_for(name) or "?"
+        spd_raw = _settled_speed(name)
         rep.add(
             f"USB {label} enumerate",
             PASS,
@@ -208,11 +245,10 @@ def phase_usb(rep: Report) -> None:
         try:
             spd = int(spd_raw)
             ok = spd >= want_speed * 0.9
-            rep.add(
-                f"USB {label} negotiated speed",
-                PASS if ok else FAIL,
-                f"{spd} Mbps (expected >= {want_speed})",
-            )
+            detail = f"{spd} Mbps (expected >= {want_speed})"
+            if not ok and want_speed >= 5000 and spd <= 480:
+                detail += " -- SuperSpeed link didn't train; suspect cable/drive/port"
+            rep.add(f"USB {label} negotiated speed", PASS if ok else FAIL, detail)
         except ValueError:
             rep.add(f"USB {label} negotiated speed", SKIP, "speed unknown")
 

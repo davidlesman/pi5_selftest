@@ -74,6 +74,7 @@ USB_DETECT_TIMEOUT = 20.0  # wait this long for a plugged drive to enumerate
 USB_REMOVE_TIMEOUT = 15.0  # wait this long for a pulled drive to disappear
 USB_MOUNT_TIMEOUT = 6.0  # wait this long for automount before the r/w test
 USB_FS_TIMEOUT = 10.0  # wait this long for the kernel to read the partition table
+USB_SETTLE_TIMEOUT = 5.0
 
 # Throttle / under-voltage bit masks from `vcgencmd get_throttled`.
 THROTTLE_BITS_NOW: List[Tuple[int, str]] = [
