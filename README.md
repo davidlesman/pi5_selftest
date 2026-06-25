@@ -63,13 +63,12 @@ pinctrl get 9-11    # want a0 ... SPI0_MISO / SPI0_MOSI / SPI0_SCLK  (NOT "input
 
 ### 2. Wire the header
 
-The suite prints the full physical-pin wiring list before the GPIO phase each run — read
-that output, not this table. BCM numbers below; physical pin in parentheses.
+The suite prints the full physical-pin wiring list before the GPIO phase each run.
 
 | Pair | BCM A → BCM B | Physical | Notes |
 |------|--------------|----------|-------|
 | 1 | GPIO2 → GPIO3 | pin3 ↔ pin5 | |
-| 2 | GPIO4 → GPIO17 | pin7 ↔ pin11 | also pull-test pins — remove jumper for `pulls` |
+| 2 | GPIO4 → GPIO17 | pin7 ↔ pin11 | also pull-test pins |
 | 3 | GPIO27 → GPIO22 | pin13 ↔ pin15 | also pull-test pins |
 | 4 | GPIO5 → GPIO6 | pin29 ↔ pin31 | also pull-test pins |
 | 5 | GPIO13 → GPIO19 | pin33 ↔ pin35 | also pull-test pins |
@@ -83,8 +82,7 @@ that output, not this table. BCM numbers below; physical pin in parentheses.
 | 13 | GPIO9 → GPIO10 | pin21 ↔ pin19 | **SPI jumper** (MISO↔MOSI) — leave in for spi+gpio phases |
 | 14 | GPIO0 → GPIO1 | pin27 ↔ pin28 | ID_SD/ID_SC — **SKIPS** if HAT EEPROM holds them |
 
-**Pulls phase**: remove all jumpers from the pull-test pins (pairs 2–7 above) before
-this phase runs — the test drives each pin from the internal pull with nothing external.
+**Pulls phase**: Jumpers can stay in, if any jumpers are on the 3.3V/5V/GND pins, remove them.
 
 **Fan**: plug into the 4-pin FAN header. 0 RPM at idle is normal; the phase commands
 a spin-up to confirm it responds.
