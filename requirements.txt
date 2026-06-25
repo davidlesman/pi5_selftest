@@ -1,0 +1,8 @@
+# Prefer apt on Raspberry Pi OS (links to system libs):
+#   sudo apt install python3-gpiozero python3-lgpio python3-serial python3-spidev
+#
+# pip fallback (e.g. in a venv):
+gpiozero
+lgpio
+pyserial
+spidev
