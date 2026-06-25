@@ -202,8 +202,8 @@ def _usb_fail_detail(stuck: str, mark: int = 0) -> str:
             f"The active system limit is {limit_ma}mA. The Pi 5 caps total USB current at 600mA "
             "unless powered by a 5V/5A PD supply or usb_max_current_enable=1 is explicitly set. "
             "A SuperSpeed drive draws more power than at USB2, causing it to brown out and "
-            "disconnect mid-spin-up. Fix the power: use the official 27W supply, set "
-            "usb_max_current_enable=1 in /boot/firmware/config.txt, or use a powered USB hub."
+            "disconnect mid-spin-up. Fix the power: use the official 27W supply, or set "
+            "usb_max_current_enable=1 in /boot/firmware/config.txt."
         )
     return _ss_fail_msg(stuck)
 
