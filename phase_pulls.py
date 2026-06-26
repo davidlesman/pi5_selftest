@@ -8,9 +8,10 @@ from .gpio_utils import _bp, _free_header_lines
 
 def phase_pulls(rep: Report) -> None:
     rep.phase("pulls")
+    pin_list = ", ".join(_bp(p) for p in PULL_TEST_PINS)
     if not prompt(
         rep,
-        f"Remove jumpers tying these pins to 3V3/5V/GND: {PULL_TEST_PINS}. "
+        f"Remove jumpers tying these pins to 3V3/5V/GND: {pin_list}. "
         "(A jumper between two of these GPIOs is now tolerated.)",
     ):
         return
