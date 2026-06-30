@@ -109,8 +109,8 @@ sudo python3 -m selftest.pi5_selftest gpio uart spi
 # Burn-in: repeat the full suite N times
 sudo python3 -m selftest.pi5_selftest full --repeat 5
 
-# Save a machine-readable JSON report
-sudo python3 -m selftest.pi5_selftest full --json report.json
+# Write report files to a specific directory (default: current dir)
+sudo python3 -m selftest.pi5_selftest full --out-dir /tmp/reports
 
 # Manage dtparam/dtoverlay yourself (don't let the suite touch them)
 sudo python3 -m selftest.pi5_selftest full --no-dt

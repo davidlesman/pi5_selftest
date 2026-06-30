@@ -1,7 +1,7 @@
 import re
 import subprocess
 import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 PASS, FAIL, SKIP, INFO = "PASS", "FAIL", "SKIP", "INFO"
@@ -190,42 +190,49 @@ def acceptance_record(runs) -> dict:
         "functional_failures": sorted(fails),
         "metric_failures": metric_fails,
         "metrics": metrics,
+        "runs": [[asdict(r) for r in rep.results] for rep in runs],
     }
 
 
-def render_markdown(rec: dict) -> str:
-    i = rec["identity"]
-    L = [
-        f"# Pi 5 acceptance — {rec['verdict']}",
-        "",
-        f"- **Serial:** {i['serial']}",
-        f"- **Model / rev:** {i['model']} / {i['revision']}",
-        f"- **Firmware:** {i['firmware']}",
-        f"- **EEPROM:** {i['eeprom']}",
-        f"- **Kernel:** {i['kernel']}",
-        f"- **Graded:** {rec['graded_at']}  ({rec['runs_graded']} run(s), worst-case)",
-        "",
-        "## Metrics",
-        "",
-        "| metric | measured | spec | result |",
-        "|---|---|---|---|",
-    ]
+def render_report(rec: dict) -> str:
+    i, v = rec["identity"], rec["verdict"]
+    L = [f"# Pi 5 acceptance report — {v}", "",
+         f"**Verdict: {v}**  ·  serial `{i['serial']}`  ·  {rec['graded_at']}", "",
+         "| field | value |", "|---|---|",
+         f"| Model / rev | {i['model']} / {i['revision']} |",
+         f"| Firmware | {i['firmware']} |",
+         f"| EEPROM | {i['eeprom']} |",
+         f"| Kernel | {i['kernel']} |",
+         f"| Runs graded | {rec['runs_graded']} (worst-case) |", "",
+         "## Graded metrics", "",
+         "| metric | measured | spec | result |", "|---|---|---|---|"]
     for k, m in rec["metrics"].items():
-        bound = (
-            f">= {m['min']}" if m["min"] is not None else f"<= {m['max']}"
-        ) + f" {m['unit']}"
+        bound = (f">= {m['min']}" if m["min"] is not None else f"<= {m['max']}") + f" {m['unit']}"
         res = {True: "ok", False: "**FAIL**", None: "n/a"}[m["pass"]]
         val = "n/a" if m["value"] is None else f"{m['value']} {m['unit']}"
         L.append(f"| {k} | {val} | {bound} | {res} |")
-    if rec["functional_failures"]:
-        L += ["", "## Functional failures"] + [
-            f"- {x}" for x in rec["functional_failures"]
-        ]
-    if rec["metric_failures"]:
-        L += ["", "## Out of spec"] + [f"- {x}" for x in rec["metric_failures"]]
-    if rec["verdict"] == "PASS":
-        L += [
-            "",
-            "_All graded checks within spec; expected non-passes (no Ethernet/I2C/manual power) ignored._",
-        ]
+    if rec["functional_failures"] or rec["metric_failures"]:
+        L += ["", "## Why it failed"]
+        L += [f"- out of spec: {x}" for x in rec["metric_failures"]]
+        L += [f"- {x}" for x in rec["functional_failures"]]
+    MARK = {"PASS": "PASS", "FAIL": "FAIL", "SKIP": "skip", "INFO": "info"}
+    multi = len(rec["runs"]) > 1
+    for ri, run in enumerate(rec["runs"], 1):
+        L += ["", f"## Run {ri} — all checks" if multi else "## All checks"]
+        phase = None
+        for c in run:
+            if c["phase"] != phase:
+                phase = c["phase"]; L += ["", f"### {phase}"]
+            line = f"- `{MARK.get(c['status'], c['status'])}` **{c['name']}**"
+            if c.get("detail"):
+                line += f" — {c['detail']}"
+            mt = c.get("metric")
+            if mt and mt.get("key") and mt.get("value") is not None:
+                bound = (f">={mt['min']}" if mt["min"] is not None else f"<={mt['max']}") + f" {mt['unit']}"
+                grade = "ok" if mt["pass"] else "**FAIL**"
+                line += f" _(graded: {mt['value']} {mt['unit']}, need {bound} → {grade})_"
+            L.append(line)
     return "\n".join(L) + "\n"
+
+
+render_markdown = render_report  # back-compat alias

@@ -26,12 +26,12 @@ Runs as a sequence of PHASES. Some are fully automatic; others are interactive
     spi       - GPIO10 MOSI -> GPIO9 MISO loopback
 
 Usage:
-    sudo python3 pi5_selftest.py full            # everything, with prompts
-    python3 pi5_selftest.py full --auto          # only automatic phases
-    sudo python3 pi5_selftest.py full --skip usb,mipi   # run all but these
-    sudo python3 pi5_selftest.py gpio uart        # just these phases
-    sudo python3 pi5_selftest.py full --repeat 5  # run the suite 5x (burn-in)
-    sudo python3 pi5_selftest.py full --json report.json
+    sudo python3 -m selftest.pi5_selftest full            # everything, always writes report files
+    python3 -m selftest.pi5_selftest full --auto          # only automatic phases
+    sudo python3 -m selftest.pi5_selftest full --skip usb,mipi   # run all but these
+    sudo python3 -m selftest.pi5_selftest gpio uart        # just these phases
+    sudo python3 -m selftest.pi5_selftest full --repeat 5  # run the suite 5x (burn-in)
+    sudo python3 -m selftest.pi5_selftest full --out-dir /tmp/reports  # write files to DIR
 
 At any interactive prompt: press Enter to do the step, or type 's' + Enter
 (or Ctrl-C) to skip the rest of that phase. So with nothing plugged in, the
@@ -53,11 +53,10 @@ import json
 import os
 import re
 import sys
-from dataclasses import asdict
 from typing import Dict, List, Optional
 
 from . import dt_manager
-from .report import Report, FAIL, SKIP, INFO, acceptance_record, render_markdown
+from .report import Report, FAIL, SKIP, INFO, acceptance_record, render_report
 from .utils import sh, have, is_root, _cfg, SkipPhase
 from .dt_manager import DTManager
 
@@ -232,7 +231,8 @@ def main() -> int:
         help="run the whole suite N times in a row (burn-in). "
         "Pairs well with --auto for unattended runs.",
     )
-    ap.add_argument("--json", metavar="PATH", help="write a JSON report")
+    ap.add_argument("--out-dir", default=".", metavar="DIR",
+                    help="where to write the report files (default: current dir)")
     args = ap.parse_args()
 
     _cfg.auto = args.auto
@@ -308,21 +308,15 @@ def main() -> int:
         print(f"   - out of spec: {x}")
     print(bar)
 
-    if args.json:
-        with open(args.json, "w") as fh:
-            json.dump([[asdict(r) for r in rep.results] for rep in runs], fh, indent=2)
-        # companion acceptance record + human-readable sheet, keyed by serial
-        d = os.path.dirname(os.path.abspath(args.json))
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        acc_json = os.path.join(d, f"acceptance_{serial}_{ts}.json")
-        acc_md = os.path.join(d, f"acceptance_{serial}_{ts}.md")
-        with open(acc_json, "w") as fh:
-            json.dump(rec, fh, indent=2)
-        with open(acc_md, "w") as fh:
-            fh.write(render_markdown(rec))
-        print(f"  Wrote raw report -> {args.json}")
-        print(f"  Wrote acceptance -> {acc_json}")
-        print(f"  Wrote sheet      -> {acc_md}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = os.path.join(args.out_dir, f"pi5_{serial}_{ts}")
+    with open(stem + ".json", "w") as fh:
+        json.dump(rec, fh, indent=2)
+    with open(stem + ".md", "w") as fh:
+        fh.write(render_report(rec))
+    print(f"  Wrote report -> {stem}.json")
+    print(f"  Wrote sheet  -> {stem}.md")
 
     return 1 if rec["verdict"] == "FAIL" else 0
 
