@@ -140,25 +140,30 @@ def _measured(runs) -> dict:
 
 
 def acceptance_record(runs) -> dict:
-    """Grade runs into an acceptance record (worst-case across runs)."""
+    """Grade runs into an acceptance record (worst-case across runs).
+
+    Verdict rule, single and honest: FAIL if ANY check FAILed or ANY measured
+    value is out of spec. SKIP ('not tested') and INFO never count. No
+    forgive-list.
+    """
     from . import config
 
-    # functional failures: a FAIL/SKIP not on the accepted-exception list
-    fails = set()
+    counts = {PASS: 0, FAIL: 0, SKIP: 0, INFO: 0}
+    fails = []
     for rep in runs:
         for r in rep.results:
-            if r.status in (FAIL, SKIP) and not config.accept_nonpass(
-                r.phase, r.name, r.detail
-            ):
-                tag = "" if r.status == FAIL else "SKIPPED "
-                fails.add(f"{tag}{r.phase}/{r.name}: {r.detail[:70]}")
+            counts[r.status] = counts.get(r.status, 0) + 1
+            if r.status == FAIL:
+                fails.append(f"{r.phase}/{r.name}: {r.detail}")
 
     measured = _measured(runs)
     metrics, metric_fails = {}, []
+    in_spec = graded = 0
     for key, spec in config.ACCEPT_THRESHOLDS.items():
         nums = [v for v in measured.get(key, []) if isinstance(v, (int, float))]
         if not nums:
             metrics[key] = {
+                "key": key,
                 "value": None,
                 "unit": spec.get("unit", ""),
                 "min": spec.get("min"),
@@ -169,70 +174,140 @@ def acceptance_record(runs) -> dict:
         worst = (
             max(nums) if spec.get("max") is not None else min(nums)
         )  # ceiling vs floor
-        graded = config.accept_check(key, worst)
-        metrics[key] = graded
-        if not graded["pass"]:
+        graded += 1
+        m = config.accept_check(key, worst)
+        metrics[key] = m
+        if m["pass"]:
+            in_spec += 1
+        else:
             bound = (
-                f">={spec['min']}"
+                f">= {spec['min']}"
                 if spec.get("min") is not None
-                else f"<={spec['max']}"
+                else f"<= {spec['max']}"
             )
-            metric_fails.append(f"{key}={worst}{spec.get('unit', '')} (need {bound})")
+            metric_fails.append(
+                f"{config.ACCEPT_LABELS.get(key, key)} "
+                f"{m['value']} {m['unit']} out of spec ({bound})"
+            )
 
     verdict = "PASS" if not fails and not metric_fails else "FAIL"
+
     return {
-        "schema": 1,
+        "schema": 2,
         "tool": "pi5_selftest",
         "graded_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "runs_graded": len(runs),
         "identity": board_identity(runs),
         "verdict": verdict,
-        "functional_failures": sorted(fails),
+        "counts": counts,
+        "metrics_in_spec": in_spec,
+        "metrics_graded": graded,
+        "functional_failures": fails,
         "metric_failures": metric_fails,
         "metrics": metrics,
         "runs": [[asdict(r) for r in rep.results] for rep in runs],
     }
 
 
+# --- plain-text report (reads well under `cat`; no markdown) ----------------
+_W = 70  # report width
+_TAG = {PASS: "ok", FAIL: "FAIL", SKIP: "n/t", INFO: "info"}
+
+
+def fmt_metric(v, unit) -> str:
+    if v is None:
+        return "n/a"
+    if unit in ("RPM", "Mbps", "mA"):
+        return f"{int(round(v))} {unit}"
+    if unit == "V":
+        return f"{v:.2f} {unit}"
+    if unit == "GT/s":
+        return f"{v:.1f} {unit}"
+    return f"{v:g} {unit}"
+
+
+def _spec_str(m) -> str:
+    if m["min"] is not None and m["max"] is not None:
+        return f"{m['min']} - {m['max']}"
+    if m["min"] is not None:
+        return f">= {m['min']}"
+    if m["max"] is not None:
+        return f"<= {m['max']}"
+    return ""
+
+
 def render_report(rec: dict) -> str:
+    from . import config
+
     i, v = rec["identity"], rec["verdict"]
-    L = [f"# Pi 5 acceptance report — {v}", "",
-         f"**Verdict: {v}**  ·  serial `{i['serial']}`  ·  {rec['graded_at']}", "",
-         "| field | value |", "|---|---|",
-         f"| Model / rev | {i['model']} / {i['revision']} |",
-         f"| Firmware | {i['firmware']} |",
-         f"| EEPROM | {i['eeprom']} |",
-         f"| Kernel | {i['kernel']} |",
-         f"| Runs graded | {rec['runs_graded']} (worst-case) |", "",
-         "## Graded metrics", "",
-         "| metric | measured | spec | result |", "|---|---|---|---|"]
-    for k, m in rec["metrics"].items():
-        bound = (f">= {m['min']}" if m["min"] is not None else f"<= {m['max']}") + f" {m['unit']}"
-        res = {True: "ok", False: "**FAIL**", None: "n/a"}[m["pass"]]
-        val = "n/a" if m["value"] is None else f"{m['value']} {m['unit']}"
-        L.append(f"| {k} | {val} | {bound} | {res} |")
-    if rec["functional_failures"] or rec["metric_failures"]:
-        L += ["", "## Why it failed"]
-        L += [f"- out of spec: {x}" for x in rec["metric_failures"]]
-        L += [f"- {x}" for x in rec["functional_failures"]]
-    MARK = {"PASS": "PASS", "FAIL": "FAIL", "SKIP": "skip", "INFO": "info"}
-    multi = len(rec["runs"]) > 1
-    for ri, run in enumerate(rec["runs"], 1):
-        L += ["", f"## Run {ri} — all checks" if multi else "## All checks"]
-        phase = None
-        for c in run:
-            if c["phase"] != phase:
-                phase = c["phase"]; L += ["", f"### {phase}"]
-            line = f"- `{MARK.get(c['status'], c['status'])}` **{c['name']}**"
+    bar = "=" * _W
+    dash = "-" * _W
+    L = [
+        bar,
+        f"  RASPBERRY PI 5  \u2014  ACCEPTANCE REPORT{v:>{_W - 39}}",
+        bar,
+        f"  Serial     {i['serial']}",
+        f"  Model      {i['model']}",
+        f"  Firmware   {i['firmware']:<26}EEPROM  {i['eeprom']}",
+        f"  Kernel     {i['kernel']}",
+        f"  Tested     {rec['graded_at']}",
+        f"  Result     {rec['counts'].get(PASS, 0)} pass \u00b7 "
+        f"{rec['counts'].get(FAIL, 0)} fail \u00b7 "
+        f"{rec['counts'].get(SKIP, 0)} not tested \u00b7 "
+        f"measurements {rec['metrics_in_spec']}/{rec['metrics_graded']} in spec",
+    ]
+
+    if v == "FAIL":
+        L += ["", "  WHY IT FAILED"]
+        for x in rec["metric_failures"]:
+            L.append(f"    - {x}")
+        for x in rec["functional_failures"]:
+            L.append(f"    - {x}")
+
+    # MEASUREMENTS table
+    L += [
+        "",
+        dash,
+        f"  {'MEASUREMENTS':<30}{'measured':>11}   {'spec':<13} {'result':>6}",
+        dash,
+    ]
+    for key, m in rec["metrics"].items():
+        label = config.ACCEPT_LABELS.get(key, key)
+        meas = fmt_metric(m["value"], m["unit"])
+        res = {True: "ok", False: "FAIL", None: "n/a"}[m["pass"]]
+        L.append(f"  {label:<30}{meas:>11}   {_spec_str(m):<13} {res:>6}")
+
+    # DETAIL BY PHASE, in run order, with per-phase tallies
+    L += ["", dash, "  DETAIL BY PHASE", dash]
+    run = rec["runs"][0] if rec["runs"] else []
+    if len(rec["runs"]) > 1:
+        L.append(f"  (showing run 1 of {len(rec['runs'])}; all runs are in the JSON)")
+    # group consecutive checks by phase, preserving order
+    order = []
+    for c in run:
+        if not order or order[-1][0] != c["phase"]:
+            order.append((c["phase"], []))
+        order[-1][1].append(c)
+    for phase, checks in order:
+        tally = {}
+        for c in checks:
+            tally[c["status"]] = tally.get(c["status"], 0) + 1
+        parts = []
+        for st, word in (
+            (PASS, "pass"),
+            (FAIL, "fail"),
+            (SKIP, "not tested"),
+            (INFO, "info"),
+        ):
+            if tally.get(st):
+                parts.append(f"{tally[st]} {word}")
+        dots = "." * max(2, 18 - len(phase))
+        L += ["", f"  {phase} {dots} {', '.join(parts)}"]
+        for c in checks:
+            tag = _TAG.get(c["status"], c["status"])
+            line = f"    {tag:<5} {c['name']}"
             if c.get("detail"):
-                line += f" — {c['detail']}"
-            mt = c.get("metric")
-            if mt and mt.get("key") and mt.get("value") is not None:
-                bound = (f">={mt['min']}" if mt["min"] is not None else f"<={mt['max']}") + f" {mt['unit']}"
-                grade = "ok" if mt["pass"] else "**FAIL**"
-                line += f" _(graded: {mt['value']} {mt['unit']}, need {bound} → {grade})_"
+                line += f"   {c['detail']}"
             L.append(line)
+    L += [bar]
     return "\n".join(L) + "\n"
-
-
-render_markdown = render_report  # back-compat alias

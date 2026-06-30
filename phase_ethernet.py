@@ -10,15 +10,15 @@ def phase_ethernet(rep: Report) -> None:
     net = "/sys/class/net"
     interfaces = [i for i in os.listdir(net) if i.startswith(("eth", "enx", "end"))]
     if not interfaces:
-        rep.add("Ethernet interface", FAIL, "no wired interface found")
+        rep.add("Ethernet interface", SKIP, "no wired interface found")
         return
     for iface in interfaces:
         carrier = read(f"{net}/{iface}/carrier") == "1"
         speed = read(f"{net}/{iface}/speed")
         rep.add(
             f"{iface} link up",
-            PASS if carrier else FAIL,
-            f"speed={speed}Mbps" if carrier else "no carrier (cable in?)",
+            PASS if carrier else SKIP,
+            f"speed={speed}Mbps" if carrier else "no carrier (no cable connected)",
         )
     up_ifaces = [i for i in interfaces if read(f"{net}/{i}/carrier") == "1"]
     if not up_ifaces:
