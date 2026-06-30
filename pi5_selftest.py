@@ -48,14 +48,16 @@ Run with sudo: the fan, PMIC, camera, and auto-enable features need root.
 """
 
 import argparse
+import datetime
 import json
+import os
 import re
 import sys
 from dataclasses import asdict
 from typing import Dict, List, Optional
 
 from . import dt_manager
-from .report import Report, FAIL, SKIP, INFO
+from .report import Report, FAIL, SKIP, INFO, acceptance_record, render_markdown
 from .utils import sh, have, is_root, _cfg, SkipPhase
 from .dt_manager import DTManager
 
@@ -289,12 +291,40 @@ def main() -> int:
             print("\n".join(failures))
         print("=" * 66)
 
+    # Acceptance verdict (spec lives in config.py; worst-case across runs).
+    rec = acceptance_record(runs)
+    serial = rec["identity"]["serial"]
+    bar = "=" * 66
+    print("\n" + bar)
+    print(f"  ACCEPTANCE VERDICT: {rec['verdict']}    (serial {serial})")
+    for k, m in rec["metrics"].items():
+        mark = {True: " ok ", False: "FAIL", None: " -- "}[m["pass"]]
+        bound = f">={m['min']}" if m["min"] is not None else f"<={m['max']}"
+        val = "n/a" if m["value"] is None else f"{m['value']} {m['unit']}"
+        print(f"   [{mark}] {k:<18} {val:>12}  (need {bound})")
+    for x in rec["functional_failures"]:
+        print(f"   - {x}")
+    for x in rec["metric_failures"]:
+        print(f"   - out of spec: {x}")
+    print(bar)
+
     if args.json:
         with open(args.json, "w") as fh:
             json.dump([[asdict(r) for r in rep.results] for rep in runs], fh, indent=2)
-        print(f"\n  Wrote JSON report ({len(runs)} run(s)) to {args.json}")
+        # companion acceptance record + human-readable sheet, keyed by serial
+        d = os.path.dirname(os.path.abspath(args.json))
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        acc_json = os.path.join(d, f"acceptance_{serial}_{ts}.json")
+        acc_md = os.path.join(d, f"acceptance_{serial}_{ts}.md")
+        with open(acc_json, "w") as fh:
+            json.dump(rec, fh, indent=2)
+        with open(acc_md, "w") as fh:
+            fh.write(render_markdown(rec))
+        print(f"  Wrote raw report -> {args.json}")
+        print(f"  Wrote acceptance -> {acc_json}")
+        print(f"  Wrote sheet      -> {acc_md}")
 
-    return 1 if total_fail else 0
+    return 1 if rec["verdict"] == "FAIL" else 0
 
 
 if __name__ == "__main__":

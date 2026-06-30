@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from .report import Report, PASS, FAIL
 from .utils import sh
+from . import config
 
 
 def _fs_rw_test(
@@ -14,6 +15,8 @@ def _fs_rw_test(
     size_mb: int = 64,
     passes: int = 1,
     chunk_mb: int = 4,
+    write_metric_key: str | None = None,
+    read_metric_key: str | None = None,
 ) -> None:
     """Write random data to a temp file, read it back, and verify by SHA-256.
 
@@ -72,7 +75,15 @@ def _fs_rw_test(
         )
         if passes > 1:
             detail = f"{passes} passes, " + detail
-        rep.add(f"{label} read/write integrity", PASS, detail)
+        write_metric = config.accept_check(write_metric_key, write_mbps) if write_metric_key else None
+        rep.add(f"{label} read/write integrity", PASS, detail, metric=write_metric)
+        if read_metric_key:
+            rep.add(
+                f"{label} read throughput",
+                INFO,
+                f"read ~{read_mbps:.0f} MB/s",
+                metric=config.accept_check(read_metric_key, read_mbps),
+            )
     except OSError as e:
         rep.add(f"{label} read/write integrity", FAIL, str(e))
     finally:

@@ -3,6 +3,7 @@ import re
 from .report import Report, PASS, FAIL, SKIP
 from .utils import sh, have
 from .config import TEMP_LIMIT_C, THROTTLE_BITS_NOW, THROTTLE_BITS_PAST
+from . import config
 
 
 def phase_thermal(rep: Report) -> None:
@@ -14,7 +15,8 @@ def phase_thermal(rep: Report) -> None:
     m = re.search(r"temp=([\d.]+)", out)
     if m:
         t = float(m.group(1))
-        rep.add("SoC temperature", PASS if t < TEMP_LIMIT_C else FAIL, f"{t:.1f} C")
+        rep.add("SoC temperature", PASS if t < TEMP_LIMIT_C else FAIL, f"{t:.1f} C",
+                metric=config.accept_check("soc_temp_idle_C", t))
     rc, out = sh(["vcgencmd", "get_throttled"])
     if "throttled=" not in out:
         return

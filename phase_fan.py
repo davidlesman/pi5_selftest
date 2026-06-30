@@ -5,6 +5,7 @@ from typing import Optional
 
 from .report import Report, PASS, FAIL, SKIP, INFO
 from .utils import read, is_root
+from . import config
 
 
 def _fan_rpm() -> Optional[int]:
@@ -52,6 +53,7 @@ def phase_fan(rep: Report) -> None:
             "Fan spin-up test",
             PASS if ok else FAIL,
             f"{rpm} -> {hi} RPM when commanded to level {maxs}",
+            metric=config.accept_check("fan_spinup_rpm", hi),
         )
     except PermissionError:
         rep.add("Fan spin-up test", SKIP, "permission denied")

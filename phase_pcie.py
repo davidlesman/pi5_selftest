@@ -8,6 +8,7 @@ from .report import Report, PASS, FAIL, SKIP, INFO
 from .utils import sh, have, read, _poll, is_root, prompt, SkipPhase
 from .fs_utils import _fs_rw_test
 from .config import NVME_TEST_SIZE_MB, NVME_CHUNK_MB, NVME_PASSES
+from . import config
 
 
 def _nvme_lsblk_rows() -> List[dict]:
@@ -88,7 +89,8 @@ def _nvme_rw_test(rep: Report) -> None:
     for row in parts:
         mp = row.get("MOUNTPOINT")
         if mp and os.path.ismount(mp) and os.access(mp, os.W_OK):
-            _fs_rw_test(rep, "NVMe", mp, NVME_TEST_SIZE_MB, NVME_PASSES, NVME_CHUNK_MB)
+            _fs_rw_test(rep, "NVMe", mp, NVME_TEST_SIZE_MB, NVME_PASSES, NVME_CHUNK_MB,
+                        write_metric_key="nvme_write_MBps", read_metric_key="nvme_read_MBps")
             return
 
     # 2. Find an unmounted filesystem partition to mount ourselves.

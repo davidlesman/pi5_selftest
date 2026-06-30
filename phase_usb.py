@@ -14,6 +14,7 @@ from .config import (
     USB_FS_TIMEOUT,
     USB_SETTLE_TIMEOUT,
 )
+from . import config
 
 
 # Optional sanity check that the operator used the right physical port. BOARD-
@@ -319,11 +320,11 @@ def _ss_fail_msg(stuck: str) -> str:
     )
 
 
-def _usb_rw(rep: Report, label: str, name: str) -> None:
+def _usb_rw(rep: Report, label: str, name: str, write_metric_key: str | None = None) -> None:
     """Run the r/w test on a USB disk, mounting it ourselves if needed."""
     mp = _poll(lambda: _mountpoint_for([name]), USB_MOUNT_TIMEOUT)
     if mp:
-        _fs_rw_test(rep, f"USB {label}", mp)
+        _fs_rw_test(rep, f"USB {label}", mp, write_metric_key=write_metric_key)
         return
     if not is_root():
         rep.add(f"USB {label} read/write", SKIP, "not mounted (run with sudo to mount)")
@@ -340,7 +341,7 @@ def _usb_rw(rep: Report, label: str, name: str) -> None:
             rep.add(f"USB {label} read/write", SKIP, f"could not mount /dev/{part}")
             return
         mounted = True
-        _fs_rw_test(rep, f"USB {label}", mnt)
+        _fs_rw_test(rep, f"USB {label}", mnt, write_metric_key=write_metric_key)
     finally:
         if mounted:
             sh(["umount", mnt])
@@ -362,6 +363,9 @@ def phase_usb(rep: Report) -> None:
         ("top-right (USB 2.0, black)", 480),
     ]
     for label, want_speed in ports:
+        is_blue = "blue" in label
+        speed_key = "usb3_link_Mbps" if is_blue else "usb2_link_Mbps"
+        write_key = "usb3_write_MBps" if is_blue else "usb2_write_MBps"
         before = _usb_occupied_ports()
         dmesg_mark = len(_dmesg_lines())
         prompt(rep, f"Plug a USB flash drive into the {label} port.")
@@ -406,7 +410,8 @@ def phase_usb(rep: Report) -> None:
             detail = f"{spd} Mbps (expected >= {want_speed})"
             if not ok and want_speed >= 5000 and spd <= 480:
                 detail += " -- SuperSpeed link didn't train; suspect cable/drive/port"
-            rep.add(f"USB {label} negotiated speed", PASS if ok else FAIL, detail)
+            rep.add(f"USB {label} negotiated speed", PASS if ok else FAIL, detail,
+                    metric=config.accept_check(speed_key, spd))
         except ValueError:
             rep.add(f"USB {label} negotiated speed", SKIP, "speed unknown")
 
@@ -432,7 +437,7 @@ def phase_usb(rep: Report) -> None:
                 f"Could not read bMaxPower; system current limit is {limit_ma}mA",
             )
 
-        _usb_rw(rep, label, name)
+        _usb_rw(rep, label, name, write_metric_key=write_key)
 
         prompt(rep, f"Remove the drive from the {label} port.")
         if not _poll(lambda: port not in _usb_occupied_ports(), USB_REMOVE_TIMEOUT):
